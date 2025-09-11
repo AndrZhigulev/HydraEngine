@@ -3,7 +3,29 @@
 //
 #include "HydraEngine.h"
 #include <iostream>
-#include <vector>
+#include <set>
+#include <vector> // Ensure vector is included
+
+const std::vector<const char*> deviceExtensions = {
+    VK_KHR_SWAPCHAIN_EXTENSION_NAME
+};
+
+// This new helper function checks if a device supports all required extensions
+bool checkDeviceExtensionSupport(VkPhysicalDevice device) {
+    uint32_t extensionCount;
+    vkEnumerateDeviceExtensionProperties(device, nullptr, &extensionCount, nullptr);
+
+    std::vector<VkExtensionProperties> availableExtensions(extensionCount);
+    vkEnumerateDeviceExtensionProperties(device, nullptr, &extensionCount, availableExtensions.data());
+
+    std::set<std::string> requiredExtensions(deviceExtensions.begin(), deviceExtensions.end());
+
+    for (const auto& extension : availableExtensions) {
+        requiredExtensions.erase(extension.extensionName);
+    }
+
+    return requiredExtensions.empty();
+}
 
 void HydraEngine::startup() {
     std::cout << "Hydra Engine is starting..." << std::endl;
@@ -17,17 +39,28 @@ void HydraEngine::startup() {
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
 
     //Create window
-    m_window = glfwCreateWindow(1024, 768, "Hydra Engine", nullptr, nullptr);
+    m_window = glfwCreateWindow(1280, 768, "Hydra Engine", nullptr, nullptr);
     if (!m_window) {
         glfwTerminate();
         return;
     }
-    //initVulkan();
     m_isRunning = true;
+
     initVulkan();
+    createSurface();
     pickPhysicalDevice();
-    m_isRunning = true;
+    createLogicalDevice();
+
 }
+
+void HydraEngine::createSurface() {
+    // glfw does all the hard work for us.
+    if (glfwCreateWindowSurface(m_instance, m_window, nullptr, &m_surface) != VK_SUCCESS) {
+       throw std::runtime_error ( "FATAL ERROR: Failed to create window surface!");
+    }
+        std::cout << "Window surface created." << std::endl;
+}
+
 
 void HydraEngine::pickPhysicalDevice() {
     // get the number of available GPUs
@@ -57,54 +90,126 @@ void HydraEngine::pickPhysicalDevice() {
 }
 
 bool HydraEngine::isDeviceSuitable(VkPhysicalDevice device) {
-    VkPhysicalDeviceProperties deviceProperties;
-    vkGetPhysicalDeviceProperties(device, &deviceProperties);
+    QueueFamilyIndices indices = findQueueFamilies(device);
 
-    // we can also query for specific features
-    VkPhysicalDeviceFeatures deviceFeatures;
-    vkGetPhysicalDeviceFeatures(device, &deviceFeatures);
+    bool extensionsSupported = checkDeviceExtensionSupport(device);
 
-    std::cout << "Checking devise: " << deviceProperties.deviceName << std::endl;
+    bool swapChainAdequate = false;
+    if (extensionsSupported) {
+        // Query for surface capabilities, formats, and present modes
+        uint32_t formatCount;
+        vkGetPhysicalDeviceSurfaceFormatsKHR(device, m_surface, &formatCount, nullptr);
 
-    // our main criteria; it MUST be a dedicated GPU
-    bool isDiscrete = deviceProperties.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU;
+        uint32_t presentModeCount;
+        vkGetPhysicalDeviceSurfacePresentModesKHR(device, m_surface, &presentModeCount, nullptr);
 
-    // and for our future RTX featuries, it should support geometry shaders
-    bool hasGeometryShader = deviceFeatures.geometryShader;
+        // A device is suitable if it has at least one supported format and present mode
+        swapChainAdequate = formatCount > 0 && presentModeCount > 0;
+    }
 
-    return isDiscrete && hasGeometryShader;
+    VkPhysicalDeviceFeatures supportedFeatures;
+    vkGetPhysicalDeviceFeatures(device, &supportedFeatures);
+
+    return indices.isComplete() && extensionsSupported && swapChainAdequate && supportedFeatures.geometryShader;
+}
+
+
+QueueFamilyIndices HydraEngine::findQueueFamilies(VkPhysicalDevice device) {
+    QueueFamilyIndices indices;
+
+    uint32_t queueFamilyCount = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(device, &queueFamilyCount, nullptr );
+    std::vector<VkQueueFamilyProperties> queueFamilies(queueFamilyCount);
+    vkGetPhysicalDeviceQueueFamilyProperties(device, &queueFamilyCount, queueFamilies.data());
+
+    int i = 0;
+    for (const auto& queueFamily : queueFamilies) {
+        //check for graphics support
+        if (queueFamily.queueFlags & VK_QUEUE_GRAPHICS_BIT) {
+            indices.graphicsFamily = i;
+        }
+
+        VkBool32 presentSupport = false;
+        vkGetPhysicalDeviceSurfaceSupportKHR(device, i, m_surface, &presentSupport);
+        if (presentSupport) {
+            indices.presentFamily = i;
+        }
+        if (indices.isComplete()) {
+            break;
+        }
+        i++;
+    }
+    return indices;
+}
+
+void HydraEngine::createLogicalDevice() {
+    QueueFamilyIndices indices = findQueueFamilies(m_physicalDevice);
+
+    std::vector<VkDeviceQueueCreateInfo> queueCreateInfos;
+    //use a set to handle cases where graphics and present queues are the same family
+    std::set<uint32_t> uniqueQueueFamilies {
+        indices.graphicsFamily.value(),
+        indices.presentFamily.value(),
+    };
+
+    float queuePriority = 1.0f;
+    for (uint32_t queueFamily : uniqueQueueFamilies) {
+        VkDeviceQueueCreateInfo queueCreateInfo = {};
+        queueCreateInfo.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+        queueCreateInfo.queueFamilyIndex = queueFamily;
+        queueCreateInfo.queueCount = 1;
+        queueCreateInfo.pQueuePriorities = &queuePriority;
+        queueCreateInfos.push_back(queueCreateInfo);
+    }
+
+    VkPhysicalDeviceFeatures deviceFeatures{}; // Use uniform initialization
+    deviceFeatures.geometryShader = VK_TRUE;
+
+
+    VkDeviceCreateInfo createInfo{};
+    createInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+    createInfo.pQueueCreateInfos = queueCreateInfos.data();
+    createInfo.queueCreateInfoCount = static_cast<uint32_t>(queueCreateInfos.size());
+    createInfo.pEnabledFeatures = &deviceFeatures;
+
+    // --- ИЗМЕНЕНИЕ: Добавляем расширения ЗДЕСЬ, перед вызовом vkCreateDevice ---
+    createInfo.enabledExtensionCount = static_cast<uint32_t>(deviceExtensions.size());
+    createInfo.ppEnabledExtensionNames = deviceExtensions.data();
+
+    // --- Оставляем только ОДИН вызов vkCreateDevice ---
+    if (vkCreateDevice(m_physicalDevice, &createInfo, nullptr, &m_device) != VK_SUCCESS) {
+        throw std::runtime_error("FATAL ERROR: Failed to create logical device!");
+    }
+
+    // get handles for both queues
+    vkGetDeviceQueue(m_device, indices.graphicsFamily.value(), 0, &m_graphicsQueue);
+    vkGetDeviceQueue(m_device, indices.presentFamily.value(), 0, &m_presentQueue);
+
+    std::cout << "Logical device created." << std::endl;
 }
 
 
 void HydraEngine::run() {
-
     //игровой цикл будет работать пока юзер не закроет окно
     while (!glfwWindowShouldClose(m_window)) {
-        // 1 input processing
-        // processInput();
-glfwPollEvents(); //проверяет все события
-        // 2 logic updating
-        // update();
-
-        // 3 rendering
-        // render();
-        //std::cout << "Engine is running..." << std::endl;
-        //m_isRunning = false;
+        glfwPollEvents(); //проверяет все события
     }
-
 }
 
 void HydraEngine::shutdown() {
     std::cout << "Hydra Engine is shutting down." << std::endl;
+
+    // --- ВАЖНО: Уничтожать объекты нужно в порядке, обратном созданию ---
+    vkDestroyDevice(m_device, nullptr);
+    vkDestroySurfaceKHR(m_instance, m_surface, nullptr);
     vkDestroyInstance(m_instance, nullptr);
+
     glfwDestroyWindow(m_window);
     glfwTerminate();
 }
 
 void HydraEngine::initVulkan() {
     // --- Application Info ---
-    // This struct is technically optional, but good practice to fill out.
-    // It tells the driver some basic info about our app.
     VkApplicationInfo appInfo{};
     appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
     appInfo.pApplicationName = "Hydra Engine";
@@ -114,13 +219,10 @@ void HydraEngine::initVulkan() {
     appInfo.apiVersion = VK_API_VERSION_1_0;
 
     // --- Instance Create Info ---
-    // This struct tells Vulkan what global extensions and validation layers we want to use.
     VkInstanceCreateInfo createInfo{};
     createInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
     createInfo.pApplicationInfo = &appInfo;
 
-    // Vulkan is a platform-agnostic API, so you need an extension to interface with the window system.
-    // GLFW has a handy function to return the extensions it needs.
     uint32_t glfwExtensionCount = 0;
     const char** glfwExtensions;
     glfwExtensions = glfwGetRequiredInstanceExtensions(&glfwExtensionCount);
@@ -130,11 +232,7 @@ void HydraEngine::initVulkan() {
     // We aren't enabling any validation layers for now
     createInfo.enabledLayerCount = 0;
 
-    // --- Create the Instance ---
-    // vkCreateInstance returns a result code. We must check if it was successful.
-    // VK_SUCCESS is the code for "everything is okay".
-    VkResult result = vkCreateInstance(&createInfo, nullptr, &m_instance);
-    if (result != VK_SUCCESS) {
+    if (vkCreateInstance(&createInfo, nullptr, &m_instance) != VK_SUCCESS) {
         throw std::runtime_error("FATAL ERROR: failed to create instance!");
     }
     std::cout << "Vulkan Instance created successfully." << std::endl;
